@@ -1,0 +1,153 @@
+#!/usr/bin/env jruby
+
+# Copyright(C) 2017 Zeebar Technolog Services, Inc.  All rights reserved
+# Free to use for K-12 schools for STEAM/STEM/Music teaching and outreach 
+# as well as personal tinkering and play.
+#
+
+require "really_simple_midi"
+require "midi-eye"
+
+require 'socket'
+
+
+REALLY_SIMPLE_UDP_DATA_PORT = 15014
+REALLY_SIMPLE_UDP_STATE_PORT  = REALLY_SIMPLE_UDP_DATA_PORT + 1
+
+# start really simple UDP server
+
+
+def log( msg )
+  puts "#{Time.now.strftime("%F %T.%L")} #{msg}" 
+end
+
+
+Signal.trap("INT") do
+  @quit = true
+end
+
+
+@input = UniMIDI::Input.gets
+
+@router = MIDIEye::Listener.new(@input)
+#
+@router.listen_for(:class => [MIDIMessage::NoteOn, MIDIMessage::NoteOff]) do |event|
+
+  @rsmidi_relay_socket ||= begin
+    new_socket = UDPSocket.new
+    new_socket.bind("192.168.4.10", REALLY_SIMPLE_UDP_STATE_PORT + 2)
+    new_socket
+  end
+
+  note_msg = event[:message]
+  note_msg_descr = if (note_msg.velocity || 0) > 0
+    "midi NoteOn #{note_msg.note} on channel #{note_msg.channel} velocity #{note_msg.velocity}"
+  else
+    "midi NoteOff #{note_msg.note} on channel #{note_msg.channel} velocity #{note_msg.velocity}"
+  end
+  midi_relay_msg_bytes = note_msg.to_bytes
+  log "midi msg #{midi_relay_msg_bytes}: #{note_msg_descr}"
+  midi_relay_msg = midi_relay_msg_bytes.pack('C*')
+
+  @rsmidi_clients.keys.each do |midi_client_ip|
+    begin
+      @rsmidi_relay_socket.send( midi_relay_msg, midi_relay_msg.size, midi_client_ip, REALLY_SIMPLE_UDP_DATA_PORT )
+    rescue Exception => se
+      log "could not relay note to #{midi_client_ip}: #{se.message}"
+    end
+  end
+
+end
+
+@router.run(:background => true)
+
+@rsmidi_clients = {}
+@rsmidi_client_ids_by_ip = {}
+
+
+def update_clients
+
+  new_client_list = {}
+  now = Time.now
+
+  @rsmidi_clients.each do |ip, last_sync_at|
+    if last_sync_at >= now - 2.0
+      new_client_list[ip] = last_sync_at
+    else
+      log "lost connection with #{ip}"
+    end
+  end
+
+  @rsmidi_clients = new_client_list
+
+end
+
+
+log "press Control-C to quit..."
+
+@rsmidi_thread = Thread.new do
+
+  begin
+    @rsmidi_state_socket = UDPSocket.new
+    @rsmidi_state_socket.bind("192.168.4.10", REALLY_SIMPLE_UDP_STATE_PORT)
+    log "rsmidi listening for state on #{@rsmidi_state_socket.addr}"
+    while !@quit
+      msg_data, sender = @rsmidi_state_socket.recvfrom(16)
+      sender_ip = sender[3]
+      
+      case msg_data[0..0] || "."
+      when "*"
+        client_id = if msg_data.size > 1
+          msg_data[1..-1]
+        else
+          nil
+        end
+        if client_id && (@rsmidi_client_ids_by_ip[sender_ip] != client_id)
+          if @rsmidi_client_ids_by_ip[sender_ip]
+            log "rsmidi client name for #{sender_ip} changed from #{@rsmidi_client_ids_by_ip[sender_ip]} to #{client_id}"
+          end
+          @rsmidi_client_ids_by_ip[sender_ip] = msg_data[1..-1]
+        end
+        if @rsmidi_clients.key?(sender_ip)
+        else
+          log "connected to #{sender_ip} aka #{client_id || "unknown"}"
+        end
+        @rsmidi_clients[sender_ip] = Time.now
+      else
+        log "ignored rsmidi state cmd: \"#{msg_data}\""
+      end
+    end
+  rescue Exception => e
+    log "rsmidi oops: #{e.message}"
+  end
+
+  log "rsmidi done"
+end
+
+
+@rsmidi_data_socket = UDPSocket.new
+@rsmidi_data_socket.bind("192.168.4.10", REALLY_SIMPLE_UDP_DATA_PORT)
+
+log "rsmidi data bound to #{@rsmidi_data_socket.addr}"
+
+while !@quit
+  update_clients
+  #puts "#{@rsmidi_clients.size} clients: #{@rsmidi_clients.keys}"
+  @rsmidi_clients.keys.each do |client_ip|
+    begin 
+      @rsmidi_data_socket.send( "\376", 0, client_ip, REALLY_SIMPLE_UDP_DATA_PORT )
+    rescue Exception => e
+      log "nogo: #{e.message}" 
+    end
+  end
+  sleep 2.0
+end
+
+p "done"
+
+#@router.close rescue nil
+
+exit
+
+
+
