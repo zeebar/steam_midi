@@ -6,6 +6,7 @@
 /doc/
 /pkg/
 /spec/reports/
+/arduino/*/steam_private.h
 /vendor/bundle/
 /.ruby-version
 /tmp/
